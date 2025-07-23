@@ -8,6 +8,9 @@ from modules.mstcn import MSTCN
 from swin.swin_transformer import SwinTransformer
 from vit.vit import _vision_transformer
 import torchvision.models as vision_models
+from transformers import AutoTokenizer, AutoModel
+import torch.nn as nn
+from modules.pyramid import Pyramid
 
 class Identity(nn.Module):
     def __init__(self):
@@ -43,10 +46,12 @@ class SLRModel(nn.Module):
         c2d_type, t_model = c2d_type.split("_")[0], c2d_type.split("_")[1]
         self.t_model = t_model
         self.c2d_type = c2d_type
+        self.adapter_type = int(self.t_model.split("-")[1]) if "-" in self.t_model else 0
 
         print(f"c2d_type: {c2d_type}, t_model: {t_model}")
-
-        if "swin" in c2d_type:
+        in_hidden_size = 768
+        
+        if "swin" in c2d_type and "3d" not in c2d_type:
             swin_t_config = {
                 "patch_size": [4, 4],
                 "embed_dim": 96,
@@ -90,31 +95,48 @@ class SLRModel(nn.Module):
                 "swins": swin_s_config,
                 "swint": swin_t_config,
                 "swinb": swin_b_config,
+                "swinslora": swin_s_config,
+                "swintlora": swin_t_config,
+                "swinblora": swin_b_config,
             }
             models = {
                 "swins": vision_models.swin_s,
                 "swint": vision_models.swin_t,
                 "swinb": vision_models.swin_b,
+                "swinslora": vision_models.swin_s,
+                "swintlora": vision_models.swin_t,
+                "swinblora": vision_models.swin_b,
             }
             weights = {
                 "swins": vision_models.Swin_S_Weights.IMAGENET1K_V1,
                 "swint": vision_models.Swin_T_Weights.IMAGENET1K_V1,
                 "swinb": vision_models.Swin_B_Weights.IMAGENET1K_V1,
+                "swinslora": vision_models.Swin_S_Weights.IMAGENET1K_V1,
+                "swintlora": vision_models.Swin_T_Weights.IMAGENET1K_V1,
+                "swinblora": vision_models.Swin_B_Weights.IMAGENET1K_V1,
             }
             ins = {
                 "swint": [96, 192, 384, 768],
                 "swins": [96, 192, 384, 768],
                 "swinb": [128, 256, 512, 1024],
+                "swinslora": [96, 192, 384, 768],
+                "swintlora": [96, 192, 384, 768],
+                "swinblora": [128, 256, 512, 1024]
             }
-
 
             model_w = models[c2d_type](weights=weights[c2d_type])
             self.conv2d = SwinTransformer(**configs[c2d_type])
             self.conv2d.load_weights(model_w)
-            self.conv2d.modify(adapter=int(self.t_model.split("-")[1]) if "-" in self.t_model else 0, ins = ins[c2d_type])
+            self.conv2d.modify(adapter=self.adapter_type, ins = ins[c2d_type], lora=True if "lora" in c2d_type else False)
             del model_w
 
-            hidden_size = 768 if c2d_type in ["swint", "swins"] else 1024
+            # hidden_size = 768 if c2d_type in ["swint", "swins", "swintlora", "swinslora"] else 1024
+            in_hidden_size = 768 if c2d_type in ["swint", "swins", "swintlora", "swinslora"] else 1024
+
+            if "lora" in c2d_type:
+                for k,v in self.conv2d.named_parameters():
+                    if "temporal_adapter" not in k and "features" in k and "lora" not in k and "norm" not in k and "mlp" not in k:
+                        v.requires_grad = False
 
             print("Swin model loaded")
 
@@ -160,23 +182,47 @@ class SLRModel(nn.Module):
 
             msg = self.conv2d.load_state_dict(model_w.state_dict())
             print(msg)
-            self.conv2d.modify(adapter=int(self.t_model.split("-")[1]) if "-" in self.t_model else 0, inC = ins[c2d_type])
+            self.conv2d.modify(adapter=self.adapter_type, inC = ins[c2d_type])
             del model_w
 
-            hidden_size = ins[c2d_type]
+            in_hidden_size = ins[c2d_type]
+
+            if self.adapter_type == 5:
+                for k, v in self.conv2d.encoder.layers.named_parameters():
+                    if "adapter" not in k:
+                        v.requires_grad = False
 
             print("VIT model loaded")
 
+        # hidden_size = 1024
+        print(num_classes, '+=========================')
 
         if "mstcn" in self.t_model:
             print(f"Using MSTCN")
-            self.conv1d = MSTCN(input_size=hidden_size, hidden_size=hidden_size, num_classes=num_classes)
+            self.conv1d = MSTCN(input_size=in_hidden_size, hidden_size=hidden_size, num_classes=num_classes)
         else:
             print(f"Using TemporalConv")
-            self.conv1d = TemporalConv(input_size=hidden_size, hidden_size=hidden_size, num_classes=num_classes, conv_type=conv_type, use_bn=use_bn)
+            self.conv1d = TemporalConv(input_size=in_hidden_size, hidden_size=hidden_size, num_classes=num_classes, conv_type=conv_type, use_bn=use_bn)
+
+        
 
         self.temporal_model = BiLSTMLayer(rnn_type='LSTM', input_size=hidden_size, hidden_size=hidden_size, num_layers=2, bidirectional=True)
         self.decoder = utils.Decode(gloss_dict, num_classes, 'beam')
+
+        invs = [2, 4]
+        self.prems_conv1d = nn.ModuleList(
+            TemporalConv(input_size=in_hidden_size//invs[i], hidden_size=hidden_size, num_classes=num_classes, conv_type=conv_type, use_bn=use_bn) 
+            for i in range(len(invs))
+        )
+        self.prems_temporal_model = nn.ModuleList(
+            BiLSTMLayer(rnn_type='LSTM', input_size=hidden_size, hidden_size=hidden_size, num_layers=2, bidirectional=True) 
+            for _ in range(len(invs))
+        )
+
+        self.prems_classifier = nn.ModuleList(
+            NormLinear(hidden_size, num_classes) if weight_norm else nn.Linear(hidden_size, num_classes) 
+            for _ in range(len(invs))
+        )
         
         if weight_norm:
             self.classifier = NormLinear(hidden_size, self.num_classes)
@@ -187,26 +233,35 @@ class SLRModel(nn.Module):
         if share_classifier:
             self.conv1d.fc = self.classifier
 
+        # self.pyramid = Pyramid()
+
+        # for k, v in self.conv2d.named_parameters():
+        #     if v.requires_grad:
+        #         print(f"Trainable parameter: {k}, shape: {v.shape}")
+
+        print("========================")
+
         # print model summary
         print(f"Model summary for {c2d_type} with {t_model}:")
         num_params = sum(p.numel() for p in self.conv2d.parameters() if p.requires_grad)
         print(f"Total number of parameters: {num_params / 1e6:.2f}M")
 
-    def masked_bn(self, inputs, len_x):
-        def pad(tensor, length):
-            return torch.cat([tensor, tensor.new(length - tensor.size(0), *tensor.size()[1:]).zero_()])
-
-        x = torch.cat([inputs[len_x[0] * idx:len_x[0] * idx + lgt] for idx, lgt in enumerate(len_x)])
-        x = self.conv2d(x)
-        x = torch.cat([pad(x[sum(len_x[:idx]):sum(len_x[:idx + 1])], len_x[0])
-                       for idx, lgt in enumerate(len_x)])
-        return x
-
-    def forward(self, x, len_x, label=None, label_lgt=None):
+    
+    def forward(self, x, len_x, label=None):
         if len(x.shape) == 5:
             framewise = self.conv2d(x.permute(0,2,1,3,4)) # framewise -> [2, 2304, 188] -> [B, D, T]
         else:
             framewise = x
+
+        if type(framewise) == tuple:
+            framewise, prems = framewise
+
+        # if hasattr(self, 'pyramid'):
+        #     self.pyramid.B = x.shape[0]
+        #     prems = self.pyramid(prems)
+        #     prems = [self.prems_conv1d[i](prems[i], len_x) for i in range(len(prems))]
+        #     prems = [self.prems_temporal_model[i](prems[i]['visual_feat'], prems[i]['feat_len']) for i in range(len(prems))]
+        #     prems = [self.prems_classifier[i](prems[i]['predictions']) for i in range(len(prems))]
 
         conv1d_outputs = self.conv1d(framewise, len_x)
         x = conv1d_outputs['visual_feat'] # x: T, B, C
@@ -219,7 +274,7 @@ class SLRModel(nn.Module):
             else self.decoder.decode(outputs, lgt, batch_first=False, probs=False)
         conv_pred = None if self.training \
             else self.decoder.decode(conv1d_outputs['conv_logits'], lgt, batch_first=False, probs=False)
-
+        
         return {
             "framewise_features": framewise,
             "visual_features": x,
@@ -230,6 +285,7 @@ class SLRModel(nn.Module):
             "recognized_sents": pred,
             "loss_LiftPool_u": conv1d_outputs['loss_LiftPool_u'] if 'loss_LiftPool_u' in conv1d_outputs.keys() else None,
             "loss_LiftPool_p": conv1d_outputs['loss_LiftPool_p'] if 'loss_LiftPool_p' in conv1d_outputs.keys() else None,
+            # "prems_logits": prems if hasattr(self, 'pyramid') else None,
         }
 
     def criterion_calculation(self, ret_dict, label, label_lgt):
@@ -239,6 +295,14 @@ class SLRModel(nn.Module):
                 loss += weight * self.loss['CTCLoss'](ret_dict["conv_logits"].log_softmax(-1),
                                                       label.cpu().int(), ret_dict["feat_len"].cpu().int(),
                                                       label_lgt.cpu().int()).mean()
+                
+            # elif k == 'PremsCTC':
+            #     if ret_dict["prems_logits"] is not None:
+            #         for i in range(len(ret_dict["prems_logits"])):
+            #             loss += weight * self.loss['CTCLoss'](ret_dict["prems_logits"][i].log_softmax(-1),
+            #                                                   label.cpu().int(), ret_dict["feat_len"].cpu().int(),
+            #                                                   label_lgt.cpu().int()).mean()
+
             elif k == 'SeqCTC':
                 loss += weight * self.loss['CTCLoss'](ret_dict["sequence_logits"].log_softmax(-1),
                                                       label.cpu().int(), ret_dict["feat_len"].cpu().int(),

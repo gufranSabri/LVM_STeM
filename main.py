@@ -32,6 +32,7 @@ class Processor():
                 os.makedirs(self.arg.work_dir)
             else:
                 print('Dir Not removed !')
+                self.arg.load_checkpoints = self.arg.work_dir + '/_best_model.pt'
         else:
             os.makedirs(self.arg.work_dir)
 
@@ -54,6 +55,8 @@ class Processor():
         self.recoder = utils.Recorder(self.arg.work_dir, self.arg.print_log, self.arg.log_interval)
         self.dataset, self.data_loader = {}, {}
         self.gloss_dict = np.load(self.arg.dataset_info['dict_path'], allow_pickle=True).item()
+
+        print(len(self.gloss_dict), 'glosses in dict')
 
         self.arg.model_args['num_classes'] = len(self.gloss_dict) + 1
         self.arg.optimizer_args['num_epoch'] = self.arg.num_epoch
@@ -189,6 +192,8 @@ class Processor():
         return modified_dict
 
     def load_checkpoint_weights(self, model, optimizer):
+        print("Loading checkpoint from: {}".format(self.arg.load_checkpoints))
+
         self.load_model_weights(model, self.arg.load_checkpoints)
         state_dict = torch.load(self.arg.load_checkpoints)
 

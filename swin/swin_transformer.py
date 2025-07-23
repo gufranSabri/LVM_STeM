@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from swin.misc import MLP, Permute
 from swin.stochastic_depth import StochasticDepth
+from slowfast_modules.fuse_helper import *
 
 def _patch_merging_pad(x: torch.Tensor) -> torch.Tensor:
     H, W, _ = x.shape[-3:]
@@ -46,6 +47,27 @@ def _get_relative_position_bias(
 
 torch.fx.wrap("_get_relative_position_bias")
 
+
+class LoRALinear(nn.Module):
+    def __init__(self, in_features, out_features, r=4, lora_alpha=1.0):
+        super().__init__()
+        self.r = r
+        self.lora_alpha = lora_alpha
+        if r > 0:
+            self.lora_A = nn.Parameter(torch.randn(out_features, r) * 0.01)
+            self.lora_B = nn.Parameter(torch.randn(r, in_features) * 0.01)
+            self.scaling = lora_alpha / r
+        else:
+            self.lora_A = None
+            self.lora_B = None
+
+    def forward(self, x):
+        if self.r > 0:
+            return F.linear(x, self.lora_A @ self.lora_B) * self.scaling
+        else:
+            return torch.zeros_like(x)
+
+
 def shifted_window_attention(
     input: Tensor,
     qkv_weight: Tensor,
@@ -60,37 +82,35 @@ def shifted_window_attention(
     proj_bias: Optional[Tensor] = None,
     logit_scale: Optional[torch.Tensor] = None,
     training: bool = True,
+    qkv_lora_weight: Optional[Tensor] = None,
 ) -> Tensor:
     B, H, W, C = input.shape
-    # pad feature maps to multiples of window size
     pad_r = (window_size[1] - W % window_size[1]) % window_size[1]
     pad_b = (window_size[0] - H % window_size[0]) % window_size[0]
     x = F.pad(input, (0, 0, 0, pad_r, 0, pad_b))
     _, pad_H, pad_W, _ = x.shape
 
     shift_size = shift_size.copy()
-    # If window size is larger than feature size, there is no need to shift window
     if window_size[0] >= pad_H:
         shift_size[0] = 0
     if window_size[1] >= pad_W:
         shift_size[1] = 0
 
-    # cyclic shift
     if sum(shift_size) > 0:
         x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1]), dims=(1, 2))
 
-    # partition windows
     num_windows = (pad_H // window_size[0]) * (pad_W // window_size[1])
     x = x.view(B, pad_H // window_size[0], window_size[0], pad_W // window_size[1], window_size[1], C)
     x = x.permute(0, 1, 3, 2, 4, 5).reshape(B * num_windows, window_size[0] * window_size[1], C)  # B*nW, Ws*Ws, C
 
-    # multi-head attention
     if logit_scale is not None and qkv_bias is not None:
         qkv_bias = qkv_bias.clone()
         length = qkv_bias.numel() // 3
         qkv_bias[length : 2 * length].zero_()
     qkv = F.linear(x, qkv_weight, qkv_bias)
 
+    if qkv_lora_weight is not None:
+        qkv = qkv + qkv_lora_weight(x)
 
     qkv = qkv.reshape(x.size(0), x.size(1), 3, num_heads, C // num_heads).permute(2, 0, 3, 1, 4)
     q, k, v = qkv[0], qkv[1], qkv[2]
@@ -144,9 +164,7 @@ def shifted_window_attention(
 
     return x
 
-
 torch.fx.wrap("shifted_window_attention")
-
 
 class ShiftedWindowAttention(nn.Module):
     def __init__(
@@ -201,7 +219,10 @@ class ShiftedWindowAttention(nn.Module):
         return _get_relative_position_bias(
             self.relative_position_bias_table, self.relative_position_index, self.window_size  # type: ignore[arg-type]
         )
-    
+
+    def lorify(self, r: int = 8, alpha: float = 1.0):
+        self.qkv_lora = LoRALinear(self.dim, self.dim * 3, r=r, lora_alpha=alpha)
+        print("Using LoRA in ShiftedWindowAttention with r =", r, "and alpha =", alpha)
 
     def forward(self, x: Tensor) -> Tensor:
         relative_position_bias = self.get_relative_position_bias()
@@ -218,6 +239,7 @@ class ShiftedWindowAttention(nn.Module):
             qkv_bias=self.qkv.bias,
             proj_bias=self.proj.bias,
             training=self.training,
+            qkv_lora_weight=self.qkv_lora if hasattr(self, 'qkv_lora') else None,
         )
 
 class SwinTransformerBlock(nn.Module):
@@ -254,6 +276,9 @@ class SwinTransformerBlock(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.normal_(m.bias, std=1e-6)
+
+    def lorify(self, r: int = 8, alpha: float = 1.0):
+        self.attn.lorify(r=r, alpha=alpha)
 
     def forward(self, x: Tensor):
         x = x + self.stochastic_depth(self.attn(self.norm1(x)))
@@ -312,6 +337,64 @@ class STAdapter(nn.Module):
         return x_id + x
 
 
+class STAdapterPE(nn.Module):
+    def __init__(self, in_channels, adapter_channels=64, kernel_size=(3, 3, 3)):
+        super().__init__()
+        self.in_channels = in_channels
+        self.adapter_channels = adapter_channels
+
+        self.norm1 = nn.LayerNorm(in_channels)
+        self.down_proj = nn.Linear(in_channels, adapter_channels)
+
+        self.dw_conv = nn.Conv3d(
+            adapter_channels, adapter_channels,
+            kernel_size=kernel_size,
+            stride=(1, 1, 1),
+            padding=tuple(k // 2 for k in kernel_size),
+            groups=adapter_channels
+        )
+
+        self.temporal_pos_emb = nn.Parameter(torch.zeros(1000, adapter_channels))  # (T, C)
+
+        self.norm2 = nn.LayerNorm(adapter_channels)
+        self.up_proj = nn.Linear(adapter_channels, in_channels)
+
+        nn.init.constant_(self.dw_conv.weight, 0.)
+        nn.init.constant_(self.dw_conv.bias, 0.)
+        nn.init.constant_(self.down_proj.bias, 0.)
+        nn.init.constant_(self.up_proj.bias, 0.)
+
+        print("USING STAdapterPE --------------------")
+
+    def forward(self, x):
+        BT, H, W, C = x.shape
+        assert C == self.in_channels
+        T = self.T
+        B = BT // T
+
+        x_id = x
+
+        x = x.view(B, T, H, W, C)
+        x = self.norm1(x)
+        x = self.down_proj(x)
+
+        # 🔸 Add Temporal Positional Encoding
+        pos_emb = self.temporal_pos_emb[:T]  # (T, C)
+        pos_emb = pos_emb[None, :, None, None, :]  # (1, T, 1, 1, C)
+        x = x + pos_emb  # (B, T, H, W, C)
+
+        x = x.permute(0, 4, 1, 2, 3).contiguous()
+
+        x = self.dw_conv(x)
+
+        x = x.permute(0, 2, 3, 4, 1).contiguous()
+        x = self.norm2(x)
+        x = self.up_proj(x)
+
+        x = x.view(BT, H, W, C)
+        return x_id + x
+
+
 
 class TemporalAdapterPE(nn.Module):
     def __init__(self, in_channels, adapter_channels=64, max_frames=64):
@@ -336,6 +419,7 @@ class TemporalAdapterPE(nn.Module):
         self.block1_conv3x3_2 = nn.Conv3d(adapter_channels, adapter_channels, kernel_size=3, padding=1)
         self.block1_bn3 = nn.BatchNorm3d(adapter_channels)
 
+        # Block 2
         self.block2_conv3x3_1 = nn.Conv3d(adapter_channels, adapter_channels, kernel_size=3, padding=1)
         self.block2_bn1 = nn.BatchNorm3d(adapter_channels)
         self.block2_conv3x3_2 = nn.Conv3d(adapter_channels, adapter_channels, kernel_size=3, padding=1)
@@ -355,6 +439,9 @@ class TemporalAdapterPE(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+        # self.weight_o = nn.Parameter(torch.ones(1), requires_grad=True)
+        # self.weight_t = nn.Parameter(torch.ones(1), requires_grad=True)
 
         print("USING TemporalAdapterPE --------------------")
 
@@ -389,6 +476,8 @@ class TemporalAdapterPE(nn.Module):
 
         x = stream1 + stream2
 
+        # x = F.gelu(x)
+
         # Block 2
         residual = x
         x = self.block2_conv3x3_1(x)
@@ -406,8 +495,11 @@ class TemporalAdapterPE(nn.Module):
         x = self.up_proj(x)
 
         x = x.view(BT, H, W, C)
-        return x_id + x
 
+        # x = self.weight_o * x_id + self.weight_t * x
+        # return x
+
+        return x_id + x
 
 
 class TemporalAdapter(nn.Module):
@@ -504,6 +596,7 @@ class TemporalAdapter(nn.Module):
         x = x.view(BT, H, W, C)
         return x_id + x
 
+    
 
 class ModifiedSwinLayer(nn.Module):
     def __init__(self, swin_layer, inC, adapter=3):
@@ -516,6 +609,11 @@ class ModifiedSwinLayer(nn.Module):
             self.temporal_adapter = TemporalAdapter(inC, adapter_channels=64)
         if adapter == 3:
             self.temporal_adapter = TemporalAdapterPE(inC, adapter_channels=64, max_frames=1000)
+        if adapter == 4:
+            self.temporal_adapter = STAdapterPE(inC, adapter_channels=64, kernel_size=(3, 3, 3))
+
+        self.adapter = adapter
+            
 
     def forward(self, x):
         self.temporal_adapter.T = self.T
@@ -608,7 +706,7 @@ class SwinTransformer(nn.Module):
         self.head = nn.Linear(self.num_features, 512)
         print(msg)
 
-    def modify(self, adapter=3, ins = [96, 192, 384, 768]):
+    def modify(self, adapter=3, ins = [96, 192, 384, 768], lora=False):
         self.adapter = adapter
         if adapter == 0: return
         if adapter:
@@ -624,11 +722,19 @@ class SwinTransformer(nn.Module):
                 ModifiedSwinLayer(self.features[7], inC=ins[3], adapter=adapter),
             )
 
+            if lora:
+                for i in range(len(self.features)):
+                    if isinstance(self.features[i], ModifiedSwinLayer):
+                        self.features[i].swin_layer[0].attn.lorify(r=8, alpha=1.0)
+                        self.features[i].swin_layer[1].attn.lorify(r=8, alpha=1.0)
+
             print("ADAPTERS INITIALIZED --------------------")
 
     def forward(self, x):
         x = x.permute(0, 2, 1, 3, 4)  # (B, T, C, H, W)
         B, T, C, H, W = x.shape
+        prems = []
+
 
         if self.adapter != 0:
             self.features[1].T = T
@@ -638,11 +744,25 @@ class SwinTransformer(nn.Module):
 
         x = x.reshape(B * T, C, H, W)
 
-        x = self.features(x)
+        x = self.features[0](x)
+        x = self.features[1](x)
+        x = self.features[2](x)
+        x = self.features[3](x)
+        prems.append(x)
+        x = self.features[4](x)
+        x = self.features[5](x)
+        prems.append(x)
+        x = self.features[6](x)
+        x = self.features[7](x)
+        prems.append(x)
+        
+        # x = self.features(x)
+
         x = self.norm(x)
         x = self.permute(x)
         x = self.avgpool(x)
         x = self.flatten(x)
         x = x.reshape(B, T, self.num_features).permute(0, 2, 1)  # (B, D, T)
 
-        return x
+        return x, prems
+    

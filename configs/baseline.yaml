@@ -16,11 +16,12 @@ evaluate_tool: python
 loss_weights:
   SeqCTC: 1.0
   ConvCTC: 1.0
-  ConvExtraCTC: 1.0
+  PremsCTC: 1.0
   Dist: 25.0
-  DistExtra: 25.0
   Cp: 0.001
   Cu: 0.001
+  DistExtra: 25.0
+  ConvExtraCTC: 1.0
 
 optimizer_args:
   optimizer: Adam
@@ -47,9 +48,9 @@ slowfast_config: SLOWFAST_64x2_R101_50_50.yaml
 decode_mode: beam
 model_args:
   num_classes: 1296
-  c2d_type: swinad_bilstm
-
+  c2d_type: swins_mstcn-3
   conv_type: 2
   use_bn: 1
   share_classifier: 1
   weight_norm: True
+

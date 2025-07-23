@@ -130,3 +130,63 @@ class MSTCN(nn.Module):
             "loss_LiftPool_u": loss_u1 + loss_u2,
             "loss_LiftPool_p": loss_p1 + loss_p2
         }
+
+
+class MultiStreamMSTCN(nn.Module):
+    def __init__(self, fast_input_size, slow_input_size, hidden_size, use_bn=False, num_classes=-1):
+        super(MultiStreamMSTCN, self).__init__()
+        self.use_bn = use_bn
+        self.fast_input_size = fast_input_size
+        self.slow_input_size = slow_input_size
+        self.main_input_size = fast_input_size + slow_input_size
+        self.hidden_size = hidden_size
+        self.num_classes = num_classes
+
+        # Common kernel sequence to determine T reduction
+        self.kernel_size = ['K5', 'P2', 'K5', 'P2']
+
+        # One MSTCN for each stream: fast, slow, and combined
+        self.fast_mstcn = MSTCN(fast_input_size, hidden_size, use_bn, num_classes)
+        self.slow_mstcn = MSTCN(slow_input_size, hidden_size, use_bn, num_classes)
+        self.main_mstcn = MSTCN(self.main_input_size, hidden_size, use_bn, num_classes)
+
+    def update_lgt(self, lgt):
+        feat_len = copy.deepcopy(lgt)
+        for ks in self.kernel_size:
+            if ks[0] == 'P':
+                feat_len = torch.div(feat_len, 2, rounding_mode='floor')
+            elif ks[0] == 'K':
+                feat_len -= int(ks[1]) - 1
+        return feat_len
+
+    def forward(self, x, lgt):
+        # x: (B, C, T) where C = slow_input_size + fast_input_size
+        slow_x = x[:, :self.slow_input_size]
+        fast_x = x[:, self.slow_input_size:]
+
+        # Run each stream's MSTCN
+        out_main = self.main_mstcn(x, lgt)
+
+        if self.training:
+            out_slow = self.slow_mstcn(slow_x, lgt)
+            out_fast = self.fast_mstcn(fast_x, lgt)
+        else:
+            out_slow = out_fast = None
+
+        return {
+            "visual_feat": [out_main["visual_feat"]] + (
+                [out_slow["visual_feat"], out_fast["visual_feat"]] if self.training else []
+            ),
+            "conv_logits": [out_main["conv_logits"]] + (
+                [out_slow["conv_logits"], out_fast["conv_logits"]] if self.training else []
+            ),
+            "feat_len": self.update_lgt(lgt).cpu(),
+            "loss_LiftPool_u": (
+                out_main["loss_LiftPool_u"] +
+                (out_slow["loss_LiftPool_u"] + out_fast["loss_LiftPool_u"] if self.training else 0)
+            ),
+            "loss_LiftPool_p": (
+                out_main["loss_LiftPool_p"] +
+                (out_slow["loss_LiftPool_p"] + out_fast["loss_LiftPool_p"] if self.training else 0)
+            ),
+        }

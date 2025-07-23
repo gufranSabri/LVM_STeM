@@ -66,7 +66,7 @@ Follow these steps to set up the environment and get started:
 
 To run our flagship model, you can use the following command:
 ```
-python main.py --device 0,1 --dataset phoenix2014 --work-dir /data/ahmed026/phoenix/swinS_TAPE_MSTCN --model-args c2d_type=swins_mstcn-3
+python main.py --device 0,1 --dataset phoenix2014 --work-dir ./work_dir/phoenix/swinB_TAPE_MSTCN --model-args c2d_type=swinb_mstcn-3
 ```
 
 

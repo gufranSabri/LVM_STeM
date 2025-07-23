@@ -6,10 +6,7 @@ from typing import Any, Callable, NamedTuple, Optional
 import torch
 import torch.nn as nn
 from vit.misc import MLP, Conv2dNormActivation
-import torchvision.models as vision_models
 import torch.nn.functional as F
-
-
 
 
 class STAdapter(nn.Module):
@@ -59,6 +56,76 @@ class STAdapter(nn.Module):
         x = x.view(B, T, H, W, C)
         x = self.norm1(x)
         x = self.down_proj(x)
+
+        x = x.permute(0, 4, 1, 2, 3).contiguous()
+
+        x = self.dw_conv(x)
+
+        x = x.permute(0, 2, 3, 4, 1).contiguous()
+        x = self.norm2(x)
+        x = self.up_proj(x)
+
+        x = x.view(BT, H, W, C)
+        x = x.reshape(BT, HW, C)
+        x = torch.cat([cls_token, x], dim=1)
+
+        return x_id + x
+
+
+class STAdapterPE(nn.Module):
+    def __init__(self, in_channels, adapter_channels=64, kernel_size=(3, 3, 3)):
+        super().__init__()
+        self.in_channels = in_channels
+        self.adapter_channels = adapter_channels
+
+        self.norm1 = nn.LayerNorm(in_channels)
+        self.down_proj = nn.Linear(in_channels, adapter_channels)
+
+        self.dw_conv = nn.Conv3d(
+            adapter_channels, adapter_channels,
+            kernel_size=kernel_size,
+            stride=(1, 1, 1),
+            padding=tuple(k // 2 for k in kernel_size),
+            groups=adapter_channels
+        )
+
+        self.temporal_pos_emb = nn.Parameter(torch.zeros(1000, adapter_channels))  # (T, C)
+
+        self.norm2 = nn.LayerNorm(adapter_channels)
+        self.up_proj = nn.Linear(adapter_channels, in_channels)
+
+        nn.init.constant_(self.dw_conv.weight, 0.)
+        nn.init.constant_(self.dw_conv.bias, 0.)
+        nn.init.constant_(self.down_proj.bias, 0.)
+        nn.init.constant_(self.up_proj.bias, 0.)
+
+        print("USING STAdapterPE --------------------")
+
+    def forward(self, x):
+        x_id = x
+
+        BT, HW, C = x.shape
+        HW-=1
+        
+        cls_token = x[:, 0, :].unsqueeze(1)
+        x = x[:, 1:, :]
+        x = x.reshape(BT, int(HW**0.5), int(HW**0.5), C)
+
+        BT, H, W, C = x.shape
+        assert C == self.in_channels
+        T = self.T
+        B = BT // T
+
+        
+
+        x = x.view(B, T, H, W, C)
+        x = self.norm1(x)
+        x = self.down_proj(x)
+
+        # 🔸 Add Temporal Positional Encoding
+        pos_emb = self.temporal_pos_emb[:T]  # (T, C)
+        pos_emb = pos_emb[None, :, None, None, :]  # (1, T, 1, 1, C)
+        x = x + pos_emb  # (B, T, H, W, C)
 
         x = x.permute(0, 4, 1, 2, 3).contiguous()
 
@@ -300,6 +367,8 @@ class ModifiedVITLayer(nn.Module):
             self.temporal_adapter = TemporalAdapter(inC, adapter_channels=64)
         if adapter == 3:
             self.temporal_adapter = TemporalAdapterPE(inC, adapter_channels=64, max_frames=1000)
+        if adapter == 4:
+            self.temporal_adapter = STAdapterPE(inC, adapter_channels=64, kernel_size=(3, 3, 3))
 
     def forward(self, x):
         self.temporal_adapter.T = self.T
@@ -388,12 +457,27 @@ class EncoderBlock(nn.Module):
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
+    def adapt(self):
+        self.adapter1 = TemporalAdapterPE(768, adapter_channels=64, max_frames=1000)
+        self.adapter2 = TemporalAdapterPE(768, adapter_channels=64, max_frames=1000)
+
+        print("ADAPTERS INTIALIZED IN ENCODER BLOCK --------------------")
+
     def forward(self, input: torch.Tensor):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+
+        if hasattr(self, 'adapter1'):
+            self.adapter1.T = self.T
+            x = self.adapter1(input)
+
         x = self.ln_1(input)
         x, _ = self.self_attention(x, x, x, need_weights=False)
         x = self.dropout(x)
         x = x + input
+
+        if hasattr(self, 'adapter2'):
+            self.adapter2.T = self.T
+            x = self.adapter2(x)
 
         y = self.ln_2(x)
         y = self.mlp(y)
@@ -436,27 +520,28 @@ class Encoder(nn.Module):
         self.adapter = adapter
         if adapter == 0: return
         if adapter:
-            self.temporals = nn.ModuleList()
-            for i in range(len(self.layers)):
-                self.layers[i] = ModifiedVITLayer(self.layers[i], inC=inC, adapter=adapter)
+            if adapter < 4:
+                alpha = 3
+                for i in range(0, len(self.layers), alpha):
+                    self.layers[i] = ModifiedVITLayer(self.layers[i], inC=inC, adapter=adapter)
+            else:
+                for i in range(len(self.layers)):
+                    self.layers[i].adapt()
 
             print("ADAPTERS INITIALIZED --------------------")
 
     def forward(self, input: torch.Tensor):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         input = input + self.pos_embedding
+        
+        if self.adapter < 5:
+            for i in range(len(self.layers)):
+                self.layers[i].T = self.T
+        else:
+            for i in range(len(self.layers)):
+                self.layers[i].T = self.T
 
-        input = self.dropout(input)
-        for i in range(len(self.layers)):
-            self.layers[i].T = self.T
-            input = self.layers[i](input)
-
-        input = self.ln(input)
-
-        return input
-
-
-        # return self.ln(self.layers(self.dropout(input)))
+        return self.ln(self.layers(self.dropout(input)))
 
 
 class VisionTransformer(nn.Module):
