@@ -323,3 +323,10 @@ class SLRModel(nn.Module):
         self.loss['CTCLoss'] = torch.nn.CTCLoss(reduction='none', zero_infinity=False)
         self.loss['distillation'] = SeqKD(T=8)
         return self.loss
+    
+
+
+# torch.Size([2, 768, 120]) framewise shape
+# torch.Size([27, 2, 1024]) x shape after conv1d
+# torch.Size([27, 2, 1024]) x shape after lstm
+# torch.Size([27, 2, 2001]) x shape after classifier

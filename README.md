@@ -1,4 +1,5 @@
-# LVM-STeM: Large Vision Models with Spatio-Temporal Modules for Continuous Sign Language Recognition
+# Modeling Early Stage Temporal Dynamics for Continuous Sign
+Language Recognition
 
 <!-- pdf based image -->
 
@@ -8,7 +9,7 @@ This repo is based on [VAC (ICCV 2021)](https://github.com/ycmin95/VAC_CSLR), [C
 
 ![LVMSTEM](./fig/lvm_stem.png)
 
-Sign language recognition remains a challenging task due to the intricate spatio-temporal dynamics of manual and non-manual gestures. In this work, we prostem LVM-STeM, a lightweight and hierarchical spatio-temporal encoder that effectively models these complex patterns using a combination of Swin Transformer backbones enhanced with novel temporal adapters, including our custom Temporal Adapter with Positional Embeddings (TAPE). Our architecture captures fine-grained spatial features alongside short- and long-term temporal context, enabling robust sign language recognition from RGB videos without relying on multi-stream inputs or auxiliary modalities. Extensive experiments on benchmark datasets including PHOENIX14, PHOENIX14T, and CSL-Daily demonstrate that LVM-STeM achieves state-of-the-art performance against RGB-based as well as multi-modal approaches, while maintaining competitive performance against multi-stream approaches. These results highlight the strength and efficacy of our the LVM-STeM framework for continuous sign language recognition.
+Sign language recognition remains a challenging task due to the intricate spatio-temporal dynamics of manual and non-manual gestures. In this work, we propose USTM, a lightweight and hierarchical spatio-temporal encoder that effectively models these complex patterns using a combination of Swin Transformer backbones enhanced with novel temporal adapters, including our custom Temporal Adapter with Positional Embeddings (TAPE). Our architecture captures fine-grained spatial features alongside short- and long-term temporal context, enabling robust sign language recognition from RGB videos without relying on multi-stream inputs or auxiliary modalities. Extensive experiments on benchmark datasets including PHOENIX14, PHOENIX14T, and CSL-Daily demonstrate that USTM achieves state-of-the-art performance against RGB-based as well as multi-modal approaches, while maintaining competitive performance against multi-stream approaches. These results highlight the strength and efficacy of our the USTM framework for continuous sign language recognition.
 
 | Dataset       | Dev WER (%) | Test WER (%) |
 |:--------------| :-----: | :------: |
@@ -39,8 +40,8 @@ Follow these steps to set up the environment and get started:
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/gufranSabri/LVM_STeM.git
-   cd stem86K-CSLR-Isharah
+   git clone https://github.com/gufranSabri/USTM.git
+   cd USTM
    ```
 
 2. **Set up the Python environment**:
